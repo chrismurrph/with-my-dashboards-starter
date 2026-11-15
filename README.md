@@ -4,7 +4,7 @@ The starter for with-my-dashboards (WMD): a local markdown viewer and control pa
 in one [babashka](https://babashka.org) file. It is built for working alongside a coding agent: the agent writes a doc,
 runs one `curl`, and the doc is in front of you, rendered, in the right window.
 
-The story behind it: [Workflow Ergonomics with AI](https://pangglow.com/files/blog/run-my-desktop.html?from=github-mdserve).
+The story behind it - please read if you are human: [Workflow Ergonomics with AI](https://pangglow.com/files/blog/run-my-desktop.html?from=github-mdserve).
 
 - **Markdown that renders properly.** Tables, callouts, coloured diffs, syntax
   highlighting, and fixes for the cases markdown parsers usually get wrong. A
