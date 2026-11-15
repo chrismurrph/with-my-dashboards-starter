@@ -1,6 +1,7 @@
 #!/usr/bin/env bb
-;; md_lint — lint markdown for the seven failure modes that look fine in the
-;; source and only break when WMD (markdown-clj 1.12.10) renders them, plus
+;; md_lint — lint markdown for the failure modes that look fine in the source
+;; and only break when WMD renders them (nextjournal/markdown since
+;; 2026-11-09; markdown-clj 1.12.10 before, which had two more), plus
 ;; safe-edit helpers that refuse to write on an unexpected match count.
 ;;
 ;; Lint:  bb md_lint.bb FILE-OR-DIR ...        (exit 1 on hard errors, 0 else)
@@ -92,10 +93,10 @@
   "Scan markdown BODY (post-dedent, i.e. as the parser will see it; line
    numbers are unchanged by dedenting) for GitHub-table problems. Returns
    {:structural [..] :legibility [..]} — both empty for a healthy document.
-   Structural issues LOSE content in markdown-clj 1.12.10: :blank-split (a
-   blank line inside a table detaches the trailing rows, which render as an
-   EMPTY table), :no-separator (2+ pipe rows with no |---| line — also an
-   empty table), :cell-count (a row WIDER than its header silently drops the
+   Structural issues mangle or lose content: :blank-split (a blank line
+   inside a table detaches the trailing rows, which render as one line of
+   pipe text), :no-separator (2+ pipe rows with no |---| line — also pipe
+   text), :cell-count (a row WIDER than its header silently drops the
    extra cells; narrower rows lose nothing and are deliberately not flagged —
    the corpus uses them intentionally). Legibility issues are valid tables
    whose cells exceed wide-cell-threshold, aggregated one per table."
@@ -176,10 +177,10 @@
     :blank-split (str "Table starting line " table-line ": blank line at line "
                       blank-line " cuts the table — the " lost-rows
                       (if (= 1 lost-rows) " row" " rows") " from line "
-                      first-lost " will render as an empty table (content lost).")
+                      first-lost " will render as one line of pipe text, not table rows.")
     :no-separator (str rows " pipe rows starting line " line
-                       " have no |---| separator line — they will render as an"
-                       " empty table (content lost).")
+                       " have no |---| separator line — they will render as one"
+                       " line of pipe text, not a table.")
     :cell-count (str "Table starting line " table-line ": row at line " line
                      " has " row-cells " cells but the header has " header-cells
                      " — the extra cells will be silently dropped.")))
@@ -281,60 +282,6 @@
         (recur (rest ls) in-fence? (conj out [(inc i) line])))
       out)))
 
-(defn- blockquote-pipe-row?
-  "Line is a blockquote whose quoted content is a pipe table row."
-  [line]
-  (some? (re-matches #"\s{0,3}>\s*\|.*" line)))
-
-(defn- blockquote-inner
-  "The quoted content of a blockquote line, > markers stripped."
-  [line]
-  (str/replace line #"^\s{0,3}(>\s?)+" ""))
-
-(defn check-blockquoted-tables
-  "GitHub tables inside a blockquote (> | a | b |). markdown-clj does NOT
-   render tables in blockquotes: every pipe comes out as literal text and the
-   |---| separator row renders as mangled &mdash; entities. Hard error —
-   content is mangled, and it looks perfectly fine in the source."
-  [body]
-  (let [lines (vec (str/split-lines body))
-        n (count lines)]
-    (loop [i 0 in-fence? false issues []]
-      (if (>= i n)
-        issues
-        (let [line (nth lines i)]
-          (cond
-            (re-matches #"\s*(```|~~~).*" line)
-            (recur (inc i) (not in-fence?) issues)
-
-            in-fence?
-            (recur (inc i) in-fence? issues)
-
-            (and (blockquote-pipe-row? line)
-                 (< (inc i) n)
-                 (blockquote-pipe-row? (nth lines (inc i)))
-                 (re-matches table-separator-re
-                             (str/trim (blockquote-inner (nth lines (inc i))))))
-            (let [j (loop [k i]
-                      (if (and (< k n) (blockquote-pipe-row? (nth lines k)))
-                        (recur (inc k)) k))]
-              (recur j in-fence?
-                     (conj issues
-                           {:type :blockquoted-table :line (inc i)
-                            :rows (- j i 2)
-                            :text (str "Table at line " (inc i) " sits inside a"
-                                       " blockquote (> | ... |) — markdown-clj"
-                                       " does not render tables in blockquotes:"
-                                       " all " (- j i) " lines come out as"
-                                       " literal pipe text and the separator"
-                                       " row as mangled &mdash; entities"
-                                       " (content mangled). Use a bullet list"
-                                       " inside the quote, or move the table"
-                                       " out of it.")})))
-
-            :else
-            (recur (inc i) in-fence? issues)))))))
-
 (defn check-dangling-anchors
   "In-document links [text](#slug) whose slug matches no heading in BODY.
    The source reads fine; in the render the link is simply dead — clicking it
@@ -405,116 +352,11 @@
                  " Backticks belong in the link text, not the target.")})))
 
 ;; ---------------------------------------------------------------------------
-;; Underscore mangling — markdown-clj pairs ANY two underscores as emphasis,
-;; including intraword ones CommonMark would leave alone.
-;; ---------------------------------------------------------------------------
-
-(def ^:private intraword-underscore-re
-  "An underscore with an alphanumeric on BOTH sides — the kind that belongs to a
-   snake_case term rather than to deliberate _emphasis_. Two of these in one
-   block pair up and eat everything between them. The lookarounds give three
-   exemptions for free: an escaped \\_ (backslash is not alphanumeric), the
-   markers of __bold__ (an _ next to another _ fails both sides), and real
-   _italic_ (its markers sit against whitespace)."
-  #"(?<=[A-Za-z0-9])_(?=[A-Za-z0-9])")
-
-(defn- strip-link-targets
-  "LINE with the (target) half of every ](target) blanked. Measured: markdown-clj
-   leaves underscores in a link TARGET alone but mangles them in the link TEXT,
-   so the text must stay counted."
-  [line]
-  (str/replace line #"\]\([^)]*\)" "]()"))
-
-(defn- underscore-block-start?
-  "Line that begins a new block-level element, so emphasis cannot reach back
-   past it. Measured: two tight list items each holding one intraword
-   underscore do NOT pair — without this split they would sum to two and
-   false-positive, which is the one realistic false alarm this check has."
-  [line]
-  (some? (or (re-matches #"\s*([-*+]|\d+[.)])\s+.*" line)
-             (re-matches #"\s{0,3}#{1,6}\s+.*" line)
-             (re-matches #"\s{0,3}>.*" line)
-             (re-matches #" {0,3}\|.*" line))))
-
-(defn- list-item-line?
-  "A bullet or ordered list marker at the start of a line."
-  [line]
-  (some? (re-matches #"\s*([-*+]|\d+[.)])\s+.*" line)))
-
-(defn- underscore-blocks
-  "BODY outside code fences, grouped into the runs emphasis can pair within:
-   split at blank lines and at every block-level line start. Each block is a
-   vector of [1-based-line-number counted-text], the text having had inline
-   code spans and link targets blanked.
-
-   Lines indented 4+ spaces at block level are INDENTED CODE BLOCKS — measured:
-   markdown-clj renders their underscores literally — so they are skipped. The
-   same indent INSIDE a list item is continuation text, not code, so the list
-   flag keeps those counted. Accepted false negative: a mangled continuation
-   line under a list that has already been closed by a blank line."
-  [body]
-  (loop [ls (unfenced-lines body) cur [] in-list? false out []]
-    (if-let [[ln line] (first ls)]
-      (let [text (-> line strip-inline-code strip-link-targets)
-            close (fn [out] (if (seq cur) (conj out cur) out))]
-        (cond
-          (str/blank? line)
-          (recur (rest ls) [] in-list? (close out))
-
-          (and (not in-list?) (re-matches #" {4,}\S.*" line))
-          (recur (rest ls) [] false (close out))
-
-          (list-item-line? line)
-          (recur (rest ls) [[ln text]] true (close out))
-
-          (underscore-block-start? line)
-          (recur (rest ls) [[ln text]] false (close out))
-
-          :else
-          (recur (rest ls) (conj cur [ln text]) in-list? out)))
-      (if (seq cur) (conj out cur) out))))
-
-(defn check-underscore-mangling
-  "Blocks holding two or more INTRAWORD underscores. markdown-clj 1.12.10 does
-   not implement CommonMark's intraword-underscore rule: it pairs any two
-   underscores as emphasis, so `foo_bar_baz` renders `foo<i>bar</i>baz` — the
-   underscores VANISH into italics, taking no visible marker with them. The
-   reader sees `foobarbaz` and cannot tell whether it is a formatting fault or
-   an unresolved placeholder. Bites [[wiki_style_links]], bare snake_case terms,
-   bare URLs with underscores, and link text. Pairing crosses lines within a
-   block, so two separate single-underscore words on neighbouring lines mangle
-   each other. One intraword underscore alone is harmless and is not flagged.
-   Hard error — content is mangled, and the source looks perfectly fine.
-   Known false negative, accepted: `a__b__c` renders as bold and is not caught."
-  [body]
-  (vec
-   (for [block (underscore-blocks body)
-         :let [hits (for [[ln text] block
-                          :let [c (count (re-seq intraword-underscore-re text))]
-                          :when (pos? c)]
-                      [ln c])
-               total (reduce + 0 (map second hits))]
-         :when (>= total 2)
-         :let [ln (ffirst hits)
-               terms (->> (map (fn [[_ text]] text) block)
-                          (mapcat #(re-seq #"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+" %))
-                          distinct
-                          (take 3))]]
-     {:type :underscore-mangling :line ln :count total
-      :text (str "Line " ln ": " total " intraword underscores in one block"
-                 (when (seq terms)
-                   (str " (" (str/join ", " terms) ")"))
-                 " — markdown-clj pairs them as emphasis, so the underscores"
-                 " and the text between them render as italics with the"
-                 " underscores GONE (content mangled; the source looks fine)."
-                 " Wrap each term in `backticks`.")})))
-
-;; ---------------------------------------------------------------------------
 ;; Combined check + CLI.
 ;; ---------------------------------------------------------------------------
 
 (defn check-doc
-  "All eight checks over markdown BODY; PATH (may be nil) supplies the directory
+  "All the checks over markdown BODY; PATH (may be nil) supplies the directory
    for sibling-link resolution. Returns {:structural [..] :legibility [..]}
    where every issue carries a human :text — structural issues lose or mangle
    content (hard errors), legibility issues merely render badly (warnings).
@@ -525,11 +367,9 @@
         dir (some-> path io/file .getAbsoluteFile .getParent)]
     {:structural (vec (concat
                        (map #(assoc % :text (structural-issue-text %)) structural)
-                       (check-blockquoted-tables body)
                        (check-dangling-anchors body)
                        (check-sibling-links body dir)
-                       (check-backticked-link-targets body)
-                       (check-underscore-mangling body)))
+                       (check-backticked-link-targets body)))
      :legibility (mapv #(assoc % :text (legibility-issue-text %)) legibility)}))
 
 (defn lint-file

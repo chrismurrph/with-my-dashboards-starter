@@ -42,9 +42,9 @@ bb md_lint.bb FILE.md
 ```
 
 `md_lint.bb` (beside `mdserve.clj`) catches markdown that looks fine as source
-but breaks when rendered: tables in blockquotes, blank lines inside tables,
-dead `#anchor` links, links to missing sibling files, underscores eaten as
-emphasis. The same checks drive the warning banner at the top of a rendered
+but breaks when rendered: blank lines inside tables, rows wider than their
+header, dead `#anchor` links, links to missing sibling files, backticks in a
+link target. The same checks drive the warning banner at the top of a rendered
 doc.
 
 ### Other routes worth knowing
@@ -75,11 +75,12 @@ Everything is in **`mdserve.clj`**, one babashka script, top to bottom:
 3. **Memory badge and version line** on the panel.
 4. **Tabs:** `url->tab`, `tab-category` (which dot a tab has), `tab-project`
    (which project it belongs to), `read-tabs`.
-5. **Rendering:** `md-body-html-with-health` and everything above it. This
-   handles markdown-clj's weak spots: wrapped emphasis and code spans,
-   fences inside blockquotes, backslashes in inline code, indented tables. It
-   also adds diff colouring, entry lists, heading anchors and the health
-   banner.
+5. **Rendering:** `md->html` near the top of the file turns markdown into
+   HTML with nextjournal/markdown, which is built into Babashka. It passes raw
+   HTML through, leaves `$` and footnotes as written, shows YAML front matter
+   as code, and escapes a path tilde (`~/`) so it is never read as
+   strikethrough. `md-body-html-with-health` then adds diff colouring, entry
+   lists, heading anchors and the health banner.
 6. **The Explorer:** `dir-listing-md` and `view`, which serves every file
    type.
 7. **Placement:** `cdp!` (one DevTools call), `open-url-via-opener!`,

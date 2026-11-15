@@ -1,7 +1,7 @@
-# with-my-dashboards (WMD)
+# with-my-dashboards-starter
 
-A local markdown viewer and control panel, in one [babashka](https://babashka.org)
-file. It is built for working alongside a coding agent: the agent writes a doc,
+The starter for with-my-dashboards (WMD): a local markdown viewer and control panel,
+in one [babashka](https://babashka.org) file. It is built for working alongside a coding agent: the agent writes a doc,
 runs one `curl`, and the doc is in front of you, rendered, in the right window.
 
 The story behind it: [Workflow Ergonomics with AI](https://pangglow.com/files/blog/run-my-desktop.html?from=github-mdserve).
@@ -31,8 +31,7 @@ The story behind it: [Workflow Ergonomics with AI](https://pangglow.com/files/bl
 
 ## Requirements
 
-- Linux with a desktop, or macOS. The macOS support is new and has not yet been
-  tested on a real Mac.
+- Linux with a desktop, or macOS.
 - [babashka](https://babashka.org) (`bb`). `install.sh` installs it for you if
   it's missing (into `~/.local/bin`, no sudo).
 - Google Chrome or Chromium. WMD runs it with its own profile, so your
@@ -42,7 +41,7 @@ The story behind it: [Workflow Ergonomics with AI](https://pangglow.com/files/bl
 ## Install
 
 ```bash
-git clone https://github.com/chrismurrph/with-my-dashboards ~/code/wmd
+git clone https://github.com/chrismurrph/with-my-dashboards-starter ~/code/wmd
 cd ~/code/wmd
 ./install.sh
 ```

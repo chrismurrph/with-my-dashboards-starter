@@ -12,10 +12,10 @@
 ;; pages have a manual ↻ Refresh, and dashboards an opt-in auto-refresh.
 ;;
 ;; Editing this file? Read AGENTS.md first.
-(babashka.deps/add-deps '{:deps {markdown-clj/markdown-clj {:mvn/version "1.12.10"}}})
 
 (require '[org.httpkit.server :as srv]
-         '[markdown.core :as md]
+         '[nextjournal.markdown :as nmd]
+         '[hiccup2.core :as hic]
          '[clojure.string :as str]
          '[clojure.java.io :as io]
          '[clojure.edn :as edn]
@@ -27,6 +27,91 @@
         '[java.net.http HttpClient WebSocket$Listener]
         '[java.time LocalTime]
         '[java.time.format DateTimeFormatter])
+
+;; ---------------------------------------------------------------- markdown → HTML
+
+(def ^:private md-renderers
+  "nextjournal.markdown's hiccup renderers, with two changes. Raw HTML in the
+   source (an <a id> anchor, a <details> panel, a hand-built table) passes through
+   untouched: by default nextjournal shows each as a red \"Unknown type\" box.
+   Headings carry no id, so anchorize-headings still gives them GitHub slugs:
+   nextjournal's own ids keep characters such as the em dash, so in-document
+   links like (#d24-...) and ?at= would miss."
+  (let [raw (fn [_ctx node] (hic/raw (apply str (map :text (:content node)))))]
+    (assoc nmd/default-hiccup-renderers
+           :html-inline raw
+           :html-block  raw
+           :heading     (fn [ctx {:keys [heading-level] :as node}]
+                          (nmd/into-hiccup [(keyword (str "h" heading-level))] ctx node)))))
+
+(defn- outside-code-spans
+  "Apply f to the parts of prose s that are not inline code spans (a run of
+   backticks to the next run of the same length, which may cross a newline)."
+  [s f]
+  (let [m (re-matcher #"(?s)(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)" s)]
+    (loop [pos 0 acc (StringBuilder.)]
+      (if (.find m)
+        (recur (.end m) (doto acc (.append (f (subs s pos (.start m)))) (.append (.group m))))
+        (str (doto acc (.append (f (subs s pos)))))))))
+
+(defn- outside-html-tags
+  "Apply f to the parts of line s that are not HTML tags (<...>)."
+  [s f]
+  (->> (re-seq #"<[^>]*>|[^<]+|<" s)
+       (map #(if (str/starts-with? % "<") % (f %)))
+       (apply str)))
+
+(defn escape-path-tildes
+  "Markdown PRE-processor: write a ~ that starts a path (~/...) as \\~, so it is
+   never read as strikethrough. nextjournal accepts single-tilde strikethrough, so
+   two bare paths near each other, such as (~/bin) ... (~/.config/...), struck out
+   the text between them. ~~double~~ strikethrough is untouched. Left alone,
+   because there an escape would show as a backslash: fenced code (in a
+   blockquote too), inline code, raw HTML (a block that starts with < runs to the
+   next blank line; a tag mid-line), and lines indented four or more spaces
+   (indented code, or text inside a list)."
+  [md]
+  (let [esc-text (fn [t] (str/replace t #"(?<![\\~])~/" "\\\\~/"))
+        esc-line (fn [l] (if (re-find #"^ {4}" l)
+                           l
+                           (outside-html-tags l esc-text)))
+        esc      (fn [prose] (->> (str/split prose #"\n" -1) (map esc-line) (str/join "\n")))]
+    (loop [[l & more :as ls] (str/split md #"\n" -1) mode :prose prose [] out []]
+      (let [flush #(if (seq prose) (conj out (outside-code-spans (str/join "\n" prose) esc)) out)]
+        (cond
+          (empty? ls)                                (str/join "\n" (flush))
+          (re-find #"^ {0,3}(?:> ?)*(```|~~~)" l)  (recur more (if (= mode :fence) :prose :fence) [] (conj (flush) l))
+          (= mode :fence)                            (recur more :fence [] (conj out l))
+          (and (= mode :html) (str/blank? l))        (recur more :prose [] (conj out l))
+          (= mode :html)                             (recur more :html [] (conj out l))
+          (re-find #"^ {0,3}<[a-zA-Z/!]" l)        (recur more :html [] (conj (flush) l))
+          :else                                      (recur more :prose (conj prose l) out))))))
+
+(defn- front-matter-as-code
+  "Markdown PRE-processor: show YAML front matter (the --- name: ... --- header
+   of a SKILL.md) as a yaml code block. Read as markdown, its closing --- turns
+   the whole header into one large heading."
+  [md]
+  (if-let [[whole yaml] (re-find #"(?s)\A---\n(.*?)\n---[ \t]*\n" md)]
+    (str "```yaml\n" yaml "\n```\n" (subs md (count whole)))
+    md))
+
+(defn md->html
+  "Markdown to HTML with nextjournal/markdown, which is built into Babashka and
+   follows CommonMark plus the GitHub extras (tables, strikethrough, task lists,
+   bare-URL links). Replaced markdown-clj on 2026-11-09; that switch made the old
+   pre-passes unnecessary, because nextjournal gets right what they worked
+   around: emphasis and inline code across a line break, fenced code inside a
+   blockquote, a backslash in inline code, an escaped | inside a table cell, and
+   a table inside a blockquote. Its $math$ and footnote extras are off, so a
+   price like $5 and a [^1] stay as written. Returns the body's HTML with no
+   wrapping element."
+  [md]
+  (->> (nmd/parse {:disable-inline-formulas true :disable-footnotes true} (escape-path-tildes (front-matter-as-code md)))
+       (nmd/->hiccup md-renderers)
+       rest
+       (map #(str (hic/html %)))
+       (apply str)))
 
 (def home (System/getProperty "user.home"))
 
@@ -973,10 +1058,11 @@
 
 (defn colorize-diff
   "Colour diff fenced blocks in rendered markdown HTML. Matches ```diff and the
-   4-backtick ````diff fence (markdown-clj tags the latter class=\"`diff\"), which
-   resists an inner ``` in a diffed markdown file. Other code blocks untouched."
+   4-backtick ````diff fence, which resists an inner ``` in a diffed markdown
+   file: nextjournal tags both class=\"language-diff\". Other code blocks
+   untouched."
   [html]
-  (str/replace html #"(?s)<pre><code class=\"`*diff\">(.*?)</code></pre>"
+  (str/replace html #"(?s)<pre><code class=\"language-diff\">(.*?)</code></pre>"
                (fn [[_ body]] (diff->html body))))
 
 (defn format-stacktrace
@@ -1070,498 +1156,6 @@
             :else
             (recur (inc i) in-fence? (conj out line))))))))
 
-(defn- mask-for-emphasis-scan
-  "Same-length copy of chunk S with everything the emphasis scan must not see
-   blanked to \\u0000: backslash-escaped characters (both chars) and inline
-   code spans — a run of N backticks through the next run of exactly N
-   backticks, newlines included, so a newline INSIDE backticks can never be
-   picked as a join point. An unclosed backtick run stays literal text, as
-   markdown treats it. Length-preserving so indices into the mask are indices
-   into the real chunk."
-  [^String s]
-  (let [n (count s)
-        a (char-array s)]
-    (loop [i 0]
-      (when (< i n)
-        (let [c (aget a i)]
-          (cond
-            (= c \\)
-            (do (aset a i (char 0))
-                (when (< (inc i) n) (aset a (inc i) (char 0)))
-                (recur (+ i 2)))
-
-            (= c \`)
-            (let [run-end (loop [k i] (if (and (< k n) (= (aget a k) \`)) (recur (inc k)) k))
-                  run-len (- run-end i)
-                  close   (loop [k run-end]        ; start of a same-length closing run
-                            (cond
-                              (>= k n) nil
-                              (= (aget a k) \`)
-                              (let [e (loop [m k] (if (and (< m n) (= (aget a m) \`)) (recur (inc m)) m))]
-                                (if (= (- e k) run-len) k (recur e)))
-                              :else (recur (inc k))))]
-              (if close
-                (do (doseq [k (range i (+ close run-len))] (aset a k (char 0)))
-                    (recur (long (+ close run-len))))
-                (recur (long run-end))))
-
-            :else (recur (inc i))))))
-    (String. a)))
-
-(defn- emphasis-join-boundary?
-  "True when the continuation line starting after the newline at IDX in CHUNK
-   must never be joined into the line above: doing so would destroy a block
-   construct (blockquote, heading, table row, fence, list item, setext
-   underline, horizontal rule) instead of un-wrapping prose."
-  [^String chunk idx]
-  (let [end  (or (str/index-of chunk "\n" (inc idx)) (count chunk))
-        t    (str/triml (subs chunk (inc idx) end))]
-    (or (str/blank? t)
-        (str/starts-with? t ">")
-        (str/starts-with? t "#")
-        (str/starts-with? t "|")
-        (str/starts-with? t "```")
-        (str/starts-with? t "~~~")
-        (some? (re-matches #"[=-]+\s*" t))              ; setext underline
-        (some? (re-matches #"([*_-][ \t]*){3,}" t))     ; horizontal rule
-        (some? (re-matches #"[-*+][ \t].*" t))          ; bullet item
-        (some? (re-matches #"\d+[.)][ \t].*" t)))))
-
-(defn- wrapped-emphasis-newlines
-  "Indices of the newlines in CHUNK that lie strictly inside a matched *...*
-   or **...** pair (scanned over MASKED, whose indices equal CHUNK's).
-   Simplified CommonMark flanking: an opening run is followed by a non-space,
-   a closing run is preceded by one; a run that could be both closes when a
-   partner is open. Runs of 3+ asterisks are skipped as too ambiguous to
-   rewrite, and an unmatched delimiter pairs with nothing, so a lone * can
-   never swallow text. A span any of whose continuation lines is a block
-   boundary contributes no newlines at all."
-  [^String masked ^String chunk]
-  (let [n      (count masked)
-        at     (fn [i] (when (and (>= i 0) (< i n)) (.charAt masked i)))
-        space? (fn [c] (or (nil? c) (= c \space) (= c \tab) (= c \newline)))
-        spans  (loop [i 0 st1 [] st2 [] spans []]
-                 (if (>= i n)
-                   spans
-                   (if (= (at i) \*)
-                     (let [e       (loop [k i] (if (and (< k n) (= (.charAt masked k) \*)) (recur (inc k)) k))
-                           len     (- e i)
-                           opener? (not (space? (at e)))
-                           closer? (not (space? (at (dec i))))]
-                       (cond
-                         (> len 2) (recur (long e) st1 st2 spans)
-                         (= len 2) (cond
-                                     (and closer? (seq st2)) (recur (long e) st1 (pop st2) (conj spans [(peek st2) i]))
-                                     opener?                 (recur (long e) st1 (conj st2 e) spans)
-                                     :else                   (recur (long e) st1 st2 spans))
-                         :else     (cond
-                                     (and closer? (seq st1)) (recur (long e) (pop st1) st2 (conj spans [(peek st1) i]))
-                                     opener?                 (recur (long e) (conj st1 e) st2 spans)
-                                     :else                   (recur (long e) st1 st2 spans))))
-                     (recur (inc i) st1 st2 spans))))]
-    (->> spans
-         (mapcat (fn [[a b]]
-                   (let [nls (filter #(= (at %) \newline) (range a b))]
-                     (when (and (seq nls)
-                                (not-any? #(emphasis-join-boundary? chunk %) nls))
-                       nls))))
-         set)))
-
-(defn- join-emphasis-chunk
-  "CHUNK (one blank-line/fence-free run of lines) with every newline that sits
-   inside a wrapped emphasis span — plus the whitespace hugging it — replaced
-   by a single space. Everything else is byte-identical."
-  [^String chunk]
-  (let [masked (mask-for-emphasis-scan chunk)
-        idxs   (sort > (wrapped-emphasis-newlines masked chunk))]
-    (reduce (fn [^String s idx]
-              (let [a (loop [k (dec (long idx))]
-                        (if (and (>= k 0) (contains? #{\space \tab} (.charAt s k))) (recur (dec k)) (inc k)))
-                    b (loop [k (inc (long idx))]
-                        (if (and (< k (count s)) (contains? #{\space \tab} (.charAt s k))) (recur (inc k)) k))]
-                (str (subs s 0 a) " " (subs s b))))
-            chunk idxs)))
-
-(defn join-wrapped-emphasis
-  "Markdown PRE-processor: un-wrap emphasis spans that straddle a source
-   newline. markdown-clj 1.12.10's emphasis pass is line-scoped, so hard-wrapped
-   prose like *\"...call\\nsites...\"* renders its asterisks literally even
-   though it is perfectly valid GitHub markdown. Here any *...* / **...** pair
-   whose markers sit on different lines has the newline(s) between them (and
-   surrounding indentation) collapsed to single spaces, making the span
-   single-line before the parser sees it. Scope is deliberately tight: fenced
-   code, inline code, and escaped characters are invisible to the scan; only
-   newlines strictly inside a matched pair change; a span is abandoned whole
-   if joining would eat a block construct (list item, blockquote, heading,
-   table row, fence, setext underline, hr); 3+ asterisk runs and unmatched
-   delimiters join nothing. Idempotent — a joined span is single-line, so a
-   second pass finds nothing."
-  [body]
-  (let [lines       (vec (str/split-lines body))
-        n           (count lines)
-        fence-line? (fn [l] (some? (re-matches #"\s*(```|~~~).*" l)))
-        out (loop [i 0 in-fence? false out []]
-              (if (>= i n)
-                out
-                (let [line (nth lines i)]
-                  (cond
-                    (fence-line? line) (recur (inc i) (not in-fence?) (conj out line))
-                    in-fence?          (recur (inc i) true (conj out line))
-                    (str/blank? line)  (recur (inc i) false (conj out line))
-                    :else
-                    (let [j (loop [k i]
-                              (if (and (< k n)
-                                       (let [l (nth lines k)]
-                                         (and (not (str/blank? l)) (not (fence-line? l)))))
-                                (recur (inc k)) k))]
-                      (recur j false
-                             (into out (str/split-lines
-                                        (join-emphasis-chunk
-                                         (str/join "\n" (subvec lines i j)))))))))))]
-    (str (str/join "\n" out) (when (str/ends-with? body "\n") "\n"))))
-
-(defn- wrapped-code-span-newlines
-  "Indices of the newlines in CHUNK that lie strictly inside a paired inline
-   code span. A span is a run of N backticks up to the NEXT run of exactly N
-   backticks (CommonMark run-length pairing, so `` a`b `` works); an unpaired
-   run pairs with nothing and joins nothing. The opener scan skips
-   backslash-escaped backticks; the closer scan is raw, because escapes are
-   inert inside code. A span any of whose continuation lines is a block
-   boundary (emphasis-join-boundary?) contributes no newlines, but the scan
-   still resumes after its closer so later pairing matches markdown's view."
-  [^String chunk]
-  (let [n  (count chunk)
-        at (fn [i] (when (and (>= i 0) (< i n)) (.charAt chunk i)))]
-    (loop [i 0 nls []]
-      (if (>= i n)
-        (set nls)
-        (let [c (at i)]
-          (cond
-            (= c \\) (recur (+ i 2) nls)
-            (= c \`)
-            (let [run-end (loop [k i] (if (and (< k n) (= (at k) \`)) (recur (inc k)) k))
-                  run-len (- run-end i)
-                  close   (loop [k run-end]        ; start of a same-length closing run
-                            (cond
-                              (>= k n) nil
-                              (= (at k) \`)
-                              (let [e (loop [m k] (if (and (< m n) (= (at m) \`)) (recur (inc m)) m))]
-                                (if (= (- e k) run-len) k (recur e)))
-                              :else (recur (inc k))))]
-              (if close
-                (let [span-nls (filter #(= (at %) \newline) (range run-end close))]
-                  (recur (long (+ close run-len))
-                         (if (and (seq span-nls)
-                                  (not-any? #(emphasis-join-boundary? chunk %) span-nls))
-                           (into nls span-nls)
-                           nls)))
-                (recur (long run-end) nls)))
-            :else (recur (inc i) nls)))))))
-
-(defn- join-code-chunk
-  "CHUNK (one blank-line/fence-free run of lines) with every newline that sits
-   inside a paired inline code span — plus the whitespace hugging it —
-   replaced by a single space. Everything else is byte-identical."
-  [^String chunk]
-  (reduce (fn [^String s idx]
-            (let [a (loop [k (dec (long idx))]
-                      (if (and (>= k 0) (contains? #{\space \tab} (.charAt s k))) (recur (dec k)) (inc k)))
-                  b (loop [k (inc (long idx))]
-                      (if (and (< k (count s)) (contains? #{\space \tab} (.charAt s k))) (recur (inc k)) k))]
-              (str (subs s 0 a) " " (subs s b))))
-          chunk (sort > (wrapped-code-span-newlines chunk))))
-
-(defn join-wrapped-code-spans
-  "Markdown PRE-processor: un-wrap inline code spans that straddle a source
-   newline. markdown-clj 1.12.10's inline-code pass is line-scoped, so a
-   hard-wrapped `...` span never closes — worse, the orphaned backtick
-   MIS-PAIRS with the next backtick in the paragraph and steals the following
-   code span. Here any paired backtick run whose closer sits on a later line
-   has the newline(s) between them (and surrounding indentation) collapsed to
-   single spaces, making the span single-line before the parser sees it. Runs
-   pair by exact length (CommonMark), an unpaired backtick joins nothing,
-   fenced code and blank lines bound every span, and a span is abandoned
-   whole if joining would eat a block construct. Escaped backticks open
-   nothing. Idempotent — a joined span is single-line, so a second pass finds
-   nothing. Designed to run BEFORE join-wrapped-emphasis: once code spans are
-   single-line, mask-for-emphasis-scan masks them normally, so emphasis
-   wrapped around a multi-line code span joins too."
-  [body]
-  (let [lines       (vec (str/split-lines body))
-        n           (count lines)
-        fence-line? (fn [l] (some? (re-matches #"\s*(```|~~~).*" l)))
-        out (loop [i 0 in-fence? false out []]
-              (if (>= i n)
-                out
-                (let [line (nth lines i)]
-                  (cond
-                    (fence-line? line) (recur (inc i) (not in-fence?) (conj out line))
-                    in-fence?          (recur (inc i) true (conj out line))
-                    (str/blank? line)  (recur (inc i) false (conj out line))
-                    :else
-                    (let [j (loop [k i]
-                              (if (and (< k n)
-                                       (let [l (nth lines k)]
-                                         (and (not (str/blank? l)) (not (fence-line? l)))))
-                                (recur (inc k)) k))]
-                      (recur j false
-                             (into out (str/split-lines
-                                        (join-code-chunk
-                                         (str/join "\n" (subvec lines i j)))))))))))]
-    (str (str/join "\n" out) (when (str/ends-with? body "\n") "\n"))))
-
-(defn- quote-prefix-of
-  "The blockquote marker prefix of LINE — up to 3 leading spaces then one or
-   more `>` each optionally followed by one space/tab (so `> > ` nests) — or
-   nil for a non-quote line."
-  [line]
-  (second (re-find #"^( {0,3}(?:>[ \t]?)+)" line)))
-
-(defn- quote-depth-of
-  "Nesting depth of a quote prefix: how many `>` it carries."
-  [prefix]
-  (count (filter #(= % \>) prefix)))
-
-(defn join-wrapped-in-quotes
-  "Markdown PRE-processor: un-wrap emphasis and inline-code spans that
-   straddle a newline INSIDE a blockquote — the case join-wrapped-emphasis /
-   join-wrapped-code-spans deliberately reject, because there a `>`
-   continuation must not be merged into non-quote text. Here a maximal run of
-   consecutive quote lines of the SAME nesting depth (outside any outer code
-   fence) has its `>` prefixes stripped, the two existing join passes applied
-   to the inner text — so inner fences, inner blank `>` lines, inner lists,
-   tables, headings and unbalanced delimiters keep exactly the same
-   protections they have at top level — and the surviving lines re-prefixed
-   with the run's first prefix. Joining happens strictly within one depth:
-   depth changes (`>` to `>>`), lazy no-`>` continuations, and anything
-   outside quotes are untouched. Idempotent for the same reason the inner
-   passes are."
-  [body]
-  (let [lines       (vec (str/split-lines body))
-        n           (count lines)
-        fence-line? (fn [l] (some? (re-matches #"\s*(```|~~~).*" l)))
-        out (loop [i 0 in-fence? false out []]
-              (if (>= i n)
-                out
-                (let [line (nth lines i)
-                      p    (when-not in-fence? (quote-prefix-of line))]
-                  (cond
-                    (nil? p)
-                    (recur (inc i)
-                           (if (fence-line? line) (not in-fence?) in-fence?)
-                           (conj out line))
-
-                    :else
-                    (let [d (quote-depth-of p)
-                          j (loop [k i]
-                              (if (and (< k n)
-                                       (when-let [q (quote-prefix-of (nth lines k))]
-                                         (= (quote-depth-of q) d)))
-                                (recur (inc k)) k))
-                          run    (subvec lines i j)
-                          ;; trailing blank-content quote lines (bare `>`) are
-                          ;; paragraph boundaries no span can cross; hold them
-                          ;; out so split-lines can't swallow them.
-                          t      (loop [k (count run)]
-                                   (if (and (pos? k)
-                                            (str/blank? (subs (nth run (dec k))
-                                                              (count (quote-prefix-of (nth run (dec k)))))))
-                                     (recur (dec k)) k))
-                          inner  (str/join "\n" (map (fn [l] (subs l (count (quote-prefix-of l))))
-                                                     (subvec run 0 t)))
-                          joined (join-wrapped-emphasis (join-wrapped-code-spans inner))]
-                      (recur j in-fence?
-                             (-> out
-                                 (into (if (= joined inner) ; nothing joined — keep the run byte-identical
-                                         (subvec run 0 t)
-                                         (map #(str p %) (str/split-lines joined))))
-                                 (into (subvec run t)))))))))]
-    (str (str/join "\n" out) (when (str/ends-with? body "\n") "\n"))))
-
-(defn- quoted-fence-token
-  "A placeholder word for one extracted quoted fence: long, random, plain
-   alphanumerics only, so markdown-clj carries it through as inert text and
-   document text cannot collide with it."
-  []
-  (str "MDSERVEQF" (str/upper-case (str/replace (str (java.util.UUID/randomUUID)) "-" "")) "QF"))
-
-(defn- strip-quote-levels
-  "LINE minus D levels of blockquote marker (each up to 3 leading spaces, a
-   `>`, an optional space/tab), or nil when it carries fewer than D — so a
-   fence-content line that itself starts with `>` keeps that text (only the
-   enclosing quote's markers come off), and a line outside the quote returns
-   nil and bounds the fence."
-  [line d]
-  (loop [s line k 0]
-    (if (= k d)
-      s
-      (if-let [m (re-find #"^ {0,3}>[ \t]?" s)]
-        (recur (subs s (count m)) (inc k))
-        nil))))
-
-(defn extract-quoted-fences
-  "Markdown PRE-processor, first half of the quoted-fence fix. Returns
-   [body' fences] where every fenced code block nested in a blockquote —
-   which markdown-clj 1.12.10 renders as mangled quote prose — has been
-   replaced by a single quote-prefixed placeholder line, and fences maps each
-   placeholder token to {:info \"bash\" :content \"...\"} for the post-parse
-   splice. CommonMark rules: the opener is a quote line whose content is
-   3+ backticks/tildes (plus optional info string); the closer is a same-depth
-   quote line with at least as many of the same character; an UNCLOSED fence
-   is bounded at the end of its same-depth quote run, never beyond. Content
-   lines keep exactly their text minus the quote prefix. Fences outside
-   quotes, and quote-shaped lines inside them, are untouched (outer fences
-   are tracked); a placeholder is never minted for anything else, and calling
-   this on a body it already processed extracts nothing new from the
-   placeholder lines (plain words), so the pipeline stays idempotent."
-  [body]
-  (let [lines       (vec (str/split-lines body))
-        n           (count lines)
-        fence-line? (fn [l] (some? (re-matches #"\s*(```|~~~).*" l)))
-        opener-of   (fn [s] (re-matches #"\s*(`{3,}|~{3,})[ \t]*([^`~\s]*)[^`~]*" s))
-        closer-for  (fn [s marker]
-                      (some? (re-matches (re-pattern (str "\\s*" (subs marker 0 1) "{" (count marker) ",}\\s*")) s)))
-        result
-        (loop [i 0 in-fence? false out [] fences {}]
-          (if (>= i n)
-            [out fences]
-            (let [line (nth lines i)
-                  p    (when-not in-fence? (quote-prefix-of line))
-                  inner (when p (subs line (count p)))
-                  open  (when inner (opener-of inner))]
-              (cond
-                (nil? p)
-                (recur (inc i)
-                       (if (fence-line? line) (not in-fence?) in-fence?)
-                       (conj out line) fences)
-
-                (nil? open)
-                (recur (inc i) in-fence? (conj out line) fences)
-
-                :else
-                (let [[_ marker info] open
-                      d       (quote-depth-of p)
-                      run-end (loop [k (inc i)]           ; first line with fewer than d quote levels
-                                (if (and (< k n) (some? (strip-quote-levels (nth lines k) d)))
-                                  (recur (inc k)) k))
-                      close   (loop [k (inc i)]           ; closing fence line, if any
-                                (cond
-                                  (>= k run-end) nil
-                                  (closer-for (strip-quote-levels (nth lines k) d) marker) k
-                                  :else (recur (inc k))))
-                      end     (or close (dec run-end))    ; unclosed: bound at run end
-                      content (str/join "\n" (map #(strip-quote-levels % d)
-                                                  (subvec lines (inc i) (or close run-end))))
-                      token   (quoted-fence-token)]
-                  (recur (inc end) in-fence?
-                         (conj out (str p token))
-                         (assoc fences token {:info info :content content})))))))]
-    [(str (str/join "\n" (first result)) (when (str/ends-with? body "\n") "\n"))
-     (second result)]))
-
-(defn splice-quoted-fences
-  "Second half of the quoted-fence fix: HTML POST-processor. Replaces each
-   placeholder minted by extract-quoted-fences with its fence rendered
-   exactly the way markdown-clj renders an unquoted one —
-   <pre><code class=\"INFO\">escaped-content\\n</code></pre> — escaping the
-   inner text once via escape-html (&, <, > only; backslashes, pipes, = and +
-   pass through, and nothing can autolink because the content never meets the
-   markdown parser). Runs BEFORE colorize-diff in the pipeline so a quoted
-   ```diff block flows into the same colouriser as an unquoted one. A
-   placeholder sitting alone in a <p> is unwrapped for tidy block structure;
-   any other occurrence is replaced in place."
-  [html fences]
-  (reduce (fn [h [token {:keys [info content]}]]
-            (let [block (str "<pre><code"
-                             (when (seq info) (str " class=\"" info "\""))
-                             ">" (escape-html content) "\n</code></pre>")]
-              (-> h
-                  (str/replace (re-pattern (str "<p>\\s*" token "\\s*</p>")) (str/re-quote-replacement block))
-                  (str/replace token block))))
-          html fences))
-
-(defn- code-span-regions
-  "[[start end] ...] content regions of the paired inline code spans in
-   CHUNK — the same scanning discipline as wrapped-code-span-newlines: the
-   opener scan skips backslash-escaped backticks, runs pair by exact length
-   (CommonMark), the closer scan is raw, an unpaired run matches nothing."
-  [^String chunk]
-  (let [n  (count chunk)
-        at (fn [i] (when (and (>= i 0) (< i n)) (.charAt chunk i)))]
-    (loop [i 0 regions []]
-      (if (>= i n)
-        regions
-        (let [c (at i)]
-          (cond
-            (= c \\) (recur (+ i 2) regions)
-            (= c \`)
-            (let [run-end (loop [k i] (if (and (< k n) (= (at k) \`)) (recur (inc k)) k))
-                  run-len (- run-end i)
-                  close   (loop [k run-end]
-                            (cond
-                              (>= k n) nil
-                              (= (at k) \`)
-                              (let [e (loop [m k] (if (and (< m n) (= (at m) \`)) (recur (inc m)) m))]
-                                (if (= (- e k) run-len) k (recur e)))
-                              :else (recur (inc k))))]
-              (if close
-                (recur (long (+ close run-len)) (conj regions [run-end close]))
-                (recur (long run-end) regions)))
-            :else (recur (inc i) regions)))))))
-
-(defn- hide-chunk-backslashes
-  "CHUNK with every backslash inside a paired inline code span replaced by
-   TOKEN. Regions are non-overlapping and ordered, so one right-to-left pass
-   keeps the indices valid."
-  [^String chunk token]
-  (reduce (fn [^String s [a b]]
-            (str (subs s 0 a)
-                 (str/replace (subs s a b) "\\" token)
-                 (subs s b)))
-          chunk (reverse (code-span-regions chunk))))
-
-(defn hide-code-span-backslashes
-  "Markdown PRE-processor, first half of the inline-code backslash fix.
-   Returns [body' token n] where every backslash inside an inline code span
-   (outside fenced blocks) has been replaced by the inert TOKEN, and n counts
-   the replacements — [body nil 0] when there is nothing to hide, so the
-   post-pass can be skipped. Runs AFTER the join passes, so wrapped spans are
-   already single-line. Chunks are bounded by fences and blank lines exactly
-   as in join-wrapped-code-spans; quote, table and heading lines sit inside
-   chunks, so their code spans are covered too. Idempotent: once hidden, a
-   chunk holds no backslash inside a span for a second pass to find."
-  [body]
-  (let [lines       (vec (str/split-lines body))
-        n           (count lines)
-        fence-line? (fn [l] (some? (re-matches #"\s*(```|~~~).*" l)))
-        token       (str "MDSERVEBS" (str/upper-case (str/replace (str (java.util.UUID/randomUUID)) "-" "")) "SB")
-        ;; ONE LINE at a time, not chunk-wide: markdown-clj's inline-code
-        ;; pairing is line-scoped, and by this point the join passes have
-        ;; already put every legitimate wrapped span on a single line — so a
-        ;; line-scoped scan pairs exactly the spans the parser will. (Chunk-
-        ;; wide scanning let a stray backtick INSIDE one span's content — the
-        ;; picomatch [:punct:] class — shift every later pairing on the page.)
-        out (loop [i 0 in-fence? false out []]
-              (if (>= i n)
-                out
-                (let [line (nth lines i)]
-                  (cond
-                    (fence-line? line) (recur (inc i) (not in-fence?) (conj out line))
-                    in-fence?          (recur (inc i) true (conj out line))
-                    :else              (recur (inc i) false
-                                              (conj out (hide-chunk-backslashes line token)))))))
-        body' (str (str/join "\n" out) (when (str/ends-with? body "\n") "\n"))
-        hits  (count (re-seq (re-pattern token) body'))]
-    (if (pos? hits) [body' token hits] [body nil 0])))
-
-(defn restore-code-span-backslashes
-  "HTML POST-processor, second half: every TOKEN minted by
-   hide-code-span-backslashes becomes a literal backslash again. The token is
-   plain alphanumerics, so markdown-clj and the HTML escaping both carried it
-   through byte-identical; nothing else in the page can contain it."
-  [html token]
-  (if token (str/replace html token "\\") html))
-
 (def wide-cell-threshold
   "Characters in one table cell beyond which the page's non-wrapping table CSS
    (width:max-content) yields an unusably wide row. Calibrated against the doc
@@ -1588,10 +1182,10 @@
   "Scan markdown BODY (post-dedent, i.e. as the parser will see it; line
    numbers are unchanged by dedenting) for GitHub-table problems. Returns
    {:structural [..] :legibility [..]} — both empty for a healthy document.
-   Structural issues LOSE content in markdown-clj 1.12.10: :blank-split (a
-   blank line inside a table detaches the trailing rows, which render as an
-   EMPTY table), :no-separator (2+ pipe rows with no |---| line — also an
-   empty table), :cell-count (a row WIDER than its header silently drops the
+   Structural issues mangle or lose content: :blank-split (a blank line
+   inside a table detaches the trailing rows, which render as one line of
+   pipe text), :no-separator (2+ pipe rows with no |---| line — also pipe
+   text), :cell-count (a row WIDER than its header silently drops the
    extra cells; narrower rows lose nothing and are deliberately not flagged —
    the corpus uses them intentionally). Legibility issues are valid tables
    whose cells exceed wide-cell-threshold, aggregated one per table."
@@ -1675,10 +1269,10 @@
         :blank-split (str "Table starting line " table-line ": blank line at line "
                           blank-line " cuts the table — the " lost-rows
                           (if (= 1 lost-rows) " row" " rows") " from line "
-                          first-lost " will render as an empty table (content lost).")
+                          first-lost " will render as one line of pipe text, not table rows.")
         :no-separator (str rows " pipe rows starting line " line
-                           " have no |---| separator line — they will render as an"
-                           " empty table (content lost).")
+                           " have no |---| separator line — they will render as one"
+                           " line of pipe text, not a table.")
         :cell-count (str "Table starting line " table-line ": row at line " line
                          " has " row-cells " cells but the header has " header-cells
                          " — the extra cells will be silently dropped."))))
@@ -1737,7 +1331,7 @@
    alphanumeric, space, hyphen or underscore (so backticks, em/en dashes,
    colons, parentheses, / and friends simply vanish — an em-dash does NOT
    become a hyphen); then collapse each run of whitespace to a single hyphen.
-   The few HTML entities markdown-clj leaves in heading text are unescaped
+   The few HTML entities the markdown renderer leaves in heading text are unescaped
    first so &amp; contributes nothing rather than the letters \"amp\"."
   [text]
   (-> text
@@ -1746,6 +1340,7 @@
       (str/replace "&gt;" ">")
       (str/replace "&quot;" "\"")
       (str/replace "&#39;" "'")
+      (str/replace "&apos;" "'")
       str/lower-case
       (str/replace #"[^a-z0-9 _-]" "")
       str/trim
@@ -1765,7 +1360,7 @@
    order, as GitHub does. Headings that already carry attributes (raw HTML in
    the source, so possibly an id of the author's choosing) don't match the
    bare <hN> pattern and are left byte-identical, as is a heading whose slug
-   comes out empty. Code blocks are safe by construction — markdown-clj
+   comes out empty. Code blocks are safe by construction — the renderer
    HTML-escapes fence content, so no literal <h3> survives inside one."
   [html]
   (let [seen (atom {})]
@@ -1805,55 +1400,15 @@
         (try (f body path) (catch Throwable _ nil)))
       (check-doc-health-inline body)))
 
-(defn- md-render
-  "Markdown to HTML by one of three methods, chosen by two switches. nil when
-   the fences? method's placeholders fail to survive parsing intact, or would
-   remain after splicing — the caller then tries a simpler method, so no
-   content is ever lost and no placeholder can leak. Never nil without fences?.
-
-   Always, in the RENDER path only: quote-internal spans join first
-   (join-wrapped-in-quotes touches only blockquote runs, which the other two
-   passes deliberately leave alone), then code spans, then emphasis.
-
-   fences?: fenced code blocks nested in blockquotes — which markdown-clj
-   1.12.10 renders as mangled quote prose — are extracted to placeholder lines
-   before parsing and their <pre><code> HTML spliced over the placeholders
-   afterwards (extract-quoted-fences / splice-quoted-fences), so a quoted
-   ```diff block reaches colorize-diff like an unquoted one.
-
-   backslashes?: markdown-clj runs its escape->entity pass before code spans
-   are protected and then HTML-escapes the &, so a backslash escape inside
-   inline code rendered as a literal entity. Backslashes in inline code are
-   hidden behind an inert token before parsing and restored after
-   (hide-code-span-backslashes / restore-code-span-backslashes), before the
-   fence splice, whose content never passes through the parser."
-  [body fences? backslashes?]
-  (let [[body* fences] (if fences? (extract-quoted-fences body) [body {}])
-        joined        (join-wrapped-emphasis (join-wrapped-code-spans (join-wrapped-in-quotes body*)))
-        [masked tok]  (if backslashes? (hide-code-span-backslashes joined) [joined nil])
-        html          (md/md-to-html-string masked)
-        html          (if backslashes? (restore-code-span-backslashes html tok) html)]
-    (if-not fences?
-      html
-      (let [ok?     (every? #(str/includes? html %) (keys fences))
-            spliced (when ok? (splice-quoted-fences html fences))]
-        (when-not (or (not ok?) (some #(str/includes? spliced %) (keys fences)))
-          spliced)))))
-
 (defn md-body-html-with-health
   "A markdown document as page HTML: the health banner, then the body rendered
-   by the most capable md-render method that succeeds — quoted fences plus the
-   inline-code backslash fix, then quoted fences alone, then plain. The health
-   check sees the RAW body, so the line numbers it reports match the file on
-   disk."
+   by md->html and the post-passes. The health check sees the RAW body, so the
+   line numbers it reports match the file on disk."
   [path body]
   (str (health-banner-html path (check-doc-health body path))
        (anchorize-headings
         (colorize-diff
-         (blockify-entries
-          (or (md-render body true true)
-              (md-render body true false)
-              (md-render body false false)))))))
+         (blockify-entries (md->html body))))))
 
 (def dir-groups
   "Ordered [heading extension-set] pairs for the directory listing. Subdirs is
@@ -2120,7 +1675,7 @@
       (let [body (dir-listing-md path)]
         {:status 200
          :headers {"Content-Type" "text/html; charset=utf-8"}
-         :body (layout (str (doc-title path body) (when nav? " DIR")) (md/md-to-html-string body)
+         :body (layout (str (doc-title path body) (when nav? " DIR")) (md->html body)
                        (terminal-button term)
                        {:nav? nav? :dot (path-dot path)})})
 
@@ -3956,17 +3511,17 @@
 (def landing
   (layout "mdserve"
           (str
-           (md/md-to-html-string
+           (md->html
             (str "# mdserve\n\nLocal markdown viewer on `" base "`. "
                  "This is the panel window: docs that belong to no project open here.\n"))
            mem-section
            version-section
-           (md/md-to-html-string
+           (md->html
             (str "\n## Projects\n\n" (project-lines) "\n\n"
                  "Each project has its own window: its command dashboard (blue dot), "
                  "its Explorer (green dot), and the docs shown from inside it. "
                  "[Commands for this window](" base "/commands/home) run from your home directory.\n"))
-           (md/md-to-html-string
+           (md->html
             (str "\n## Remember Tabs\n\n"
                  "Save every open tab to `" tabs-file "`. The next start reopens them, "
                  "one window per project, each in dot order. A project with no window "
@@ -3975,7 +3530,7 @@
                           (str "Write the currently open tabs to " tabs-file)
                           (str base "/remember-tabs") "✓ Saved")
            (when (pos? tablet-port)
-             (str (md/md-to-html-string
+             (str (md->html
                    (str "\n## Tablet\n\n"
                         "The tablet reading list, on " tablet-base "/. **Off** stops that "
                         "server at once, so the tablet cannot connect, and it stays off across "
@@ -3992,7 +3547,7 @@
                   "tabletState();document.addEventListener('click',function(e){"
                   "if(e.target.classList.contains('tablet-btn'))setTimeout(tabletState,800);});</script>"))
            sessions-panel-section
-           (md/md-to-html-string
+           (md->html
             (str "\n## Show a doc\n\n```\ncurl \"" base "/show/ABSOLUTE/PATH/file.md\"\n```\n\n"
                  "It opens in the window of the project the file lives in, or here. "
                  "`?ws=<n>` sends it to the window of the project on workspace n instead; "
