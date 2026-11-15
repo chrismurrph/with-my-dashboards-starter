@@ -1,33 +1,34 @@
 # with-my-dashboards-starter
 
-The starter for with-my-dashboards (WMD): a local markdown viewer and control panel,
-in one [babashka](https://babashka.org) file. It is built for working alongside a coding agent: the agent writes a doc,
-runs one `curl`, and the doc is in front of you, rendered, in the right window.
+The starter for with-my-dashboards (WMD): one browser window per workspace, where
+your coding agent's sessions, docs and running processes stay local. See which
+Claude Code (CC) sessions are waiting for you, and how full each one's context is. When
+the agent has something for you to read, it runs one `curl` and the markdown doc appears in a browser tab
+in the the current workspace's window. Servers and scripts become rows of buttons,
+replacing terminals.
 
-The story behind it - please read if you are human: [Workflow Ergonomics with AI](https://pangglow.com/files/blog/run-my-desktop.html?from=github-mdserve).
+The story behind it - please read if you are human: [My LLM sessions were confusing me, so I built with-my-dashboards](https://pangglow.com/files/blog/run-my-desktop.html?from=github-mdserve).
 
-- **Markdown that renders properly.** Tables, callouts, coloured diffs, syntax
-  highlighting, and fixes for the cases markdown parsers usually get wrong. A
-  banner at the top of a doc flags anything that will not render as written.
-- **`/show` puts a doc in the right window.** Each project gets its own browser
-  window. A doc opens in the window of the project it lives in, or wherever
-  `?ws=<n>` says. Showing it again reloads the tab instead of opening another.
-- **Tabs survive a restart.** Remember Tabs saves the open tabs as EDN, and the
-  next start rebuilds the windows from that.
+- **A Sessions tab in every window.** Your Claude Code open sessions, each in the
+  window of the workspace it was started in: which ones are waiting for you, what
+  each is on now, and how full its context is, so you can wrap one up before it
+  compacts. Open a row for its trail of recaps, newest first. Below that another heading for the
+  25 sessions that ended last, each with the command that resumes it. Every
+  session is kept in a history, searchable from a sessions control panel.
 - **An Explorer.** Browse folders, open docs, code, images and PDFs. Open a
   terminal or an editor from any of them.
+- **Tabs survive a restart.** Remember Tabs saves the open tabs as EDN, and the
+  next start rebuilds the windows from that.
+- **`/show` (used by CC) puts a doc in the right window.** Each workspace/project gets its own browser
+  window. A doc opens in the window of the project it lives in.
 - **Command buttons.** Each project's dashboard runs your scripts. A service
   shows a live dot and gets Launch, Stop and Restart. A one-shot gets Run, which
   opens its log as a tab and follows it until the run ends.
-- **A Sessions tab in every window.** Your Claude Code sessions, each in the
-  window of the project it was started in: which ones are waiting for you, what
-  each is on now, and how full its context is, so you can wrap one up before it
-  compacts. Open a row for its trail of recaps, newest first. Below them are the
-  25 sessions that ended last, each with the command that resumes it. Every
-  session is kept in a history, searched from the panel or with
-  `./session-find.sh WORDS`.
 - **A tablet reading list** (optional). Push a doc to a tablet on your LAN for
   reading on the couch. The panel, or `./tablet.sh off`, turns it off at once.
+- **Markdown that renders properly.** Tables, callouts, coloured diffs, syntax
+  highlighting, and fixes for the cases markdown parsers usually get wrong. A
+  banner at the top of a doc flags anything that will not render as written.
 
 ## Requirements
 
